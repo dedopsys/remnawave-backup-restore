@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 INSTALL_DIR="/opt/rw-backup-restore"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
@@ -653,6 +653,9 @@ BOT_BACKUP_ENABLED="$BOT_BACKUP_ENABLED"
 BOT_BACKUP_PATH="$BOT_BACKUP_PATH"
 BOT_BACKUP_SELECTED="$BOT_BACKUP_SELECTED"
 BOT_BACKUP_DB_USER="$BOT_BACKUP_DB_USER"
+REMNAWAVE_DB_CONTAINER="$REMNAWAVE_DB_CONTAINER"
+REMNAWAVE_DB_VOLUME="$REMNAWAVE_DB_VOLUME"
+APP_CONTAINER_NAME="$APP_CONTAINER_NAME"
 EOF
     chmod 600 "$CONFIG_FILE" || { print_message "ERROR" "Не удалось установить права доступа (600) для ${BOLD}${CONFIG_FILE}${RESET}. Проверьте разрешения."; exit 1; }
     print_message "SUCCESS" "Конфигурация сохранена."
@@ -669,6 +672,9 @@ load_or_create_config() {
         CRON_TIMES=${CRON_TIMES:-}
         REMNALABS_ROOT_DIR=${REMNALABS_ROOT_DIR:-}
         TG_MESSAGE_THREAD_ID=${TG_MESSAGE_THREAD_ID:-}
+        REMNAWAVE_DB_CONTAINER=${REMNAWAVE_DB_CONTAINER:-remnawave-db}
+        REMNAWAVE_DB_VOLUME=${REMNAWAVE_DB_VOLUME:-remnawave-db-data}
+        APP_CONTAINER_NAME=${APP_CONTAINER_NAME:-remnawave}
         
         local config_updated=false
 
@@ -909,6 +915,19 @@ load_or_create_config() {
             done
             echo ""
 
+            print_message "ACTION" "Настройка Docker контейнеров"
+            echo -e "       Используйте значения по умолчанию, если вы запускали ${CYAN}docker compose${RESET} без флага ${BOLD}-p${RESET}"
+            echo -e "       Если вы использовали ${CYAN}docker compose -p project_name${RESET}, укажите имена с префиксом проекта"
+            echo -e "       Например: ${BOLD}project_name-remnawave-db-1${RESET} вместо ${BOLD}remnawave-db${RESET}"
+            echo ""
+            read -rp "    Имя контейнера БД (по умолчанию remnawave-db): " REMNAWAVE_DB_CONTAINER
+            REMNAWAVE_DB_CONTAINER=${REMNAWAVE_DB_CONTAINER:-remnawave-db}
+            read -rp "    Имя volume БД (по умолчанию remnawave-db-data): " REMNAWAVE_DB_VOLUME
+            REMNAWAVE_DB_VOLUME=${REMNAWAVE_DB_VOLUME:-remnawave-db-data}
+            read -rp "    Имя контейнера приложения (по умолчанию remnawave): " APP_CONTAINER_NAME
+            APP_CONTAINER_NAME=${APP_CONTAINER_NAME:-remnawave}
+            echo ""
+
             mkdir -p "$INSTALL_DIR" || { print_message "ERROR" "Не удалось создать каталог установки ${BOLD}${INSTALL_DIR}${RESET}. Проверьте права доступа."; exit 1; }
             mkdir -p "$BACKUP_DIR" || { print_message "ERROR" "Не удалось создать каталог для бэкапов ${BOLD}${BACKUP_DIR}${RESET}. Проверьте права доступа."; exit 1; }
             save_config
@@ -943,8 +962,7 @@ escape_markdown_v2() {
 
 get_remnawave_version() {
     local version_output
-    version_output=$(docker exec remnawave sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json
- 2>/dev/null)
+    version_output=$(docker exec "$APP_CONTAINER_NAME" sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null)
     if [[ -z "$version_output" ]]; then
         echo "не определена"
     else
@@ -1112,9 +1130,9 @@ create_backup() {
         exit 1
     }
     
-    if ! docker inspect remnawave-db > /dev/null 2>&1 || ! docker container inspect -f '{{.State.Running}}' remnawave-db 2>/dev/null | grep -q "true"; then
-        echo -e "${RED}❌ Ошибка: Контейнер ${BOLD}'remnawave-db'${RESET} не найден или не запущен. Невозможно создать бэкап базы данных.${RESET}"
-        local error_msg="❌ Ошибка: Контейнер ${BOLD}'remnawave-db'${RESET} не найден или не запущен. Не удалось создать бэкап."
+    if ! docker inspect "$REMNAWAVE_DB_CONTAINER" > /dev/null 2>&1 || ! docker container inspect -f '{{.State.Running}}' "$REMNAWAVE_DB_CONTAINER" 2>/dev/null | grep -q "true"; then
+        echo -e "${RED}❌ Ошибка: Контейнер ${BOLD}'${REMNAWAVE_DB_CONTAINER}'${RESET} не найден или не запущен. Невозможно создать бэкап базы данных.${RESET}"
+        local error_msg="❌ Ошибка: Контейнер ${BOLD}'${REMNAWAVE_DB_CONTAINER}'${RESET} не найден или не запущен. Не удалось создать бэкап."
         if [[ "$UPLOAD_METHOD" == "telegram" ]]; then
             send_telegram_message "$error_msg" "None"
         elif [[ "$UPLOAD_METHOD" == "google_drive" ]]; then
@@ -1124,7 +1142,7 @@ create_backup() {
     fi
     
     print_message "INFO" "Создание PostgreSQL дампа и сжатие в файл..."
-    if ! docker exec -t "remnawave-db" pg_dumpall -c -U "$DB_USER" | gzip -9 > "$BACKUP_DIR/$BACKUP_FILE_DB"; then
+    if ! docker exec -t "$REMNAWAVE_DB_CONTAINER" pg_dumpall -c -U "$DB_USER" | gzip -9 > "$BACKUP_DIR/$BACKUP_FILE_DB"; then
         STATUS=$?
         echo -e "${RED}❌ Ошибка при создании дампа PostgreSQL. Код выхода: ${BOLD}$STATUS${RESET}. Проверьте имя пользователя БД и доступ к контейнеру.${RESET}"
         local error_msg="❌ Ошибка при создании дампа PostgreSQL. Код выхода: ${BOLD}${STATUS}${RESET}"
@@ -1631,11 +1649,11 @@ restore_backup() {
     fi
     
     print_message "INFO" "Проверка и удаление старых томов БД Remnawave..."
-    if docker volume ls -q | grep -q "remnawave-db-data"; then
-        if docker volume rm remnawave-db-data 2>/dev/null; then
-            print_message "SUCCESS" "Старый том БД remnawave-db-data удален."
+    if docker volume ls -q | grep -q "$REMNAWAVE_DB_VOLUME"; then
+        if docker volume rm "$REMNAWAVE_DB_VOLUME" 2>/dev/null; then
+            print_message "SUCCESS" "Старый том БД ${REMNAWAVE_DB_VOLUME} удален."
         else
-            print_message "WARN" "Не удалось удалить том remnawave-db-data (возможно, используется контейнером)."
+            print_message "WARN" "Не удалось удалить том ${REMNAWAVE_DB_VOLUME} (возможно, используется контейнером)."
         fi
     else
         print_message "INFO" "Старых томов БД не найдено."
@@ -1657,9 +1675,9 @@ restore_backup() {
     
     echo ""
     print_message "INFO" "Запуск контейнера с базой данных Remnawave..."
-    docker compose rm -f remnawave-db > /dev/null 2>&1
-    
-    if ! docker compose up -d remnawave-db; then
+    docker compose rm -f "$REMNAWAVE_DB_CONTAINER" > /dev/null 2>&1
+
+    if ! docker compose up -d "$REMNAWAVE_DB_CONTAINER"; then
         print_message "ERROR" "Не удалось запустить контейнер БД Remnawave."
         [[ -n "$temp_restore_dir" && -d "$temp_restore_dir" ]] && rm -rf "$temp_restore_dir"
         read -rp "Нажмите Enter для возврата в меню..."
@@ -1671,7 +1689,7 @@ restore_backup() {
     local wait_count=0
     local max_wait=60
     
-    until [ "$(docker inspect --format='{{.State.Health.Status}}' remnawave-db)" == "healthy" ]; do
+    until [ "$(docker inspect --format='{{.State.Health.Status}}' "$REMNAWAVE_DB_CONTAINER")" == "healthy" ]; do
         sleep 2
         echo -n "."
         wait_count=$((wait_count + 1))
@@ -1707,7 +1725,7 @@ restore_backup() {
         return 1
     fi
     
-    if ! docker exec -i remnawave-db psql -q -U "${DB_USER}" -d "$restore_db_name" > /dev/null 2> "$temp_restore_dir/restore_errors.log" < "$DUMP_FILE"; then
+    if ! docker exec -i "$REMNAWAVE_DB_CONTAINER" psql -q -U "${DB_USER}" -d "$restore_db_name" > /dev/null 2> "$temp_restore_dir/restore_errors.log" < "$DUMP_FILE"; then
         print_message "ERROR" "Ошибка при восстановлении дампа базы данных."
         echo ""
         print_message "WARN" "${YELLOW}Лог ошибок восстановления:${RESET}"
@@ -2038,6 +2056,7 @@ configure_settings() {
         echo "   2. Настройки Google Drive"
         echo "   3. Имя пользователя БД Remnawave"
         echo "   4. Путь Remnawave"
+        echo "   5. Настройки Docker контейнеров"
         echo ""
         echo "   0. Вернуться в главное меню"
         echo ""
@@ -2264,6 +2283,65 @@ configure_settings() {
                 print_message "SUCCESS" "Путь Remnawave успешно обновлен на ${BOLD}${REMNALABS_ROOT_DIR}${RESET}."
                 echo ""
                 read -rp "Нажмите Enter для продолжения..."
+                ;;
+            5)
+                while true; do
+                    clear
+                    echo -e "${GREEN}${BOLD}Настройки Docker контейнеров${RESET}"
+                    echo ""
+                    print_message "INFO" "Текущее имя контейнера БД: ${BOLD}${REMNAWAVE_DB_CONTAINER}${RESET}"
+                    print_message "INFO" "Текущее имя volume БД: ${BOLD}${REMNAWAVE_DB_VOLUME}${RESET}"
+                    print_message "INFO" "Текущее имя контейнера приложения: ${BOLD}${APP_CONTAINER_NAME}${RESET}"
+                    echo ""
+                    echo -e "       ${YELLOW}Если вы использовали ${CYAN}docker compose -p project_name${YELLOW}, укажите имена с префиксом проекта${RESET}"
+                    echo -e "       ${YELLOW}Например: ${BOLD}project_name-remnawave-db-1${RESET}"
+                    echo ""
+                    echo "   1. Изменить имя контейнера БД"
+                    echo "   2. Изменить имя volume БД"
+                    echo "   3. Изменить имя контейнера приложения"
+                    echo ""
+                    echo "   0. Назад"
+                    echo ""
+                    read -rp "${GREEN}[?]${RESET} Выберите пункт: " docker_choice
+                    echo ""
+
+                    case $docker_choice in
+                        1)
+                            read -rp "   Введите новое имя контейнера БД: " NEW_DB_CONTAINER
+                            if [[ -n "$NEW_DB_CONTAINER" ]]; then
+                                REMNAWAVE_DB_CONTAINER="$NEW_DB_CONTAINER"
+                                save_config
+                                print_message "SUCCESS" "Имя контейнера БД успешно обновлено."
+                            else
+                                print_message "WARN" "Имя не может быть пустым."
+                            fi
+                            ;;
+                        2)
+                            read -rp "   Введите новое имя volume БД: " NEW_DB_VOLUME
+                            if [[ -n "$NEW_DB_VOLUME" ]]; then
+                                REMNAWAVE_DB_VOLUME="$NEW_DB_VOLUME"
+                                save_config
+                                print_message "SUCCESS" "Имя volume БД успешно обновлено."
+                            else
+                                print_message "WARN" "Имя не может быть пустым."
+                            fi
+                            ;;
+                        3)
+                            read -rp "   Введите новое имя контейнера приложения: " NEW_APP_CONTAINER
+                            if [[ -n "$NEW_APP_CONTAINER" ]]; then
+                                APP_CONTAINER_NAME="$NEW_APP_CONTAINER"
+                                save_config
+                                print_message "SUCCESS" "Имя контейнера приложения успешно обновлено."
+                            else
+                                print_message "WARN" "Имя не может быть пустым."
+                            fi
+                            ;;
+                        0) break ;;
+                        *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите один из предложенных пунктов." ;;
+                    esac
+                    echo ""
+                    read -rp "Нажмите Enter для продолжения..."
+                done
                 ;;
             0) break ;;
             *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите один из предложенных пунктов." ;;
